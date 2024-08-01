@@ -1,0 +1,448 @@
+import Koa from 'koa';
+import { decrypt, encrypt } from 'utils/cipher';
+import mongoose from 'mongoose';
+const ObjectId = mongoose.Types.ObjectId;
+
+import companyCompanyModel from 'models/company/company_company_info';
+import companyDepartmentModel from 'models/company/company_department_info';
+import syncSummaryLogModel from 'models/log/sync_summary_log';
+import syncErrorLogModel from 'models/log/sync_error_log';
+import syncHeaderModel from 'models/log/sync_header_info';
+import syncSummarySyncdataLogModel from 'models/log/sync_summary_syncdata_log';
+
+const syncDepartment = async (ctx: Koa.Context) => {
+	try {
+		const userId = ctx.response.get('userId');
+		const tenantFlag = ctx.response.get('tenantFlag');
+
+		const targetCompanyCompanyModel = companyCompanyModel({ tenantFlag });
+		const targetCompanyDepartmentModel = companyDepartmentModel({ tenantFlag });
+		const targetSyncSummaryLogModel = syncSummaryLogModel({ tenantFlag });
+		const targetSyncErrorLogModel = syncErrorLogModel({ tenantFlag });
+		const targetSyncHeaderModel = syncHeaderModel({ tenantFlag });
+		const targetSyncSummarySyncdataLogModel = syncSummarySyncdataLogModel({ tenantFlag });
+
+		const { flag, data, fileName, companyCode } = ctx.request.body as any;
+
+		//========================================================================================================
+		// 복호화
+		//========================================================================================================
+		let decoded;
+
+		try {
+			decoded = decrypt(data);
+		} catch (err) {
+			console.log(err);
+			const response = {
+				statusCode: 400,
+				body: JSON.stringify({
+				'error': 'BROKEN_DATA',
+				}),
+			};
+
+			return response;
+		}
+		//========================================================================================================
+
+
+		//조직 정보
+		const departments = [];
+
+
+		//dept_id를 저장할 맵을 정의한다.
+		const deptMap: { [key: string]: boolean } = {};
+
+
+		//프로세스 체크 카운트
+		let processChkCount = 0;
+
+
+		try {
+			const rows = decoded.split(/\r?\n/);
+			const spliter = rows[0][12];
+
+
+			//========================================================================================================
+			// 헤더 정보 가져오기
+			//========================================================================================================
+			let headerArray: string[] = [];
+
+
+			let headers = await targetSyncHeaderModel.find({companyCode: companyCode}).select('orgHeader');
+
+			/*
+			nmp_sync_header_infos 컬렉션의 데이타 정보 예시.(ex.LG CNS - GUC006), LG CNS이외에 더 많은 회사의 헤더정보가 존재하고, 회사마다 조금씩 헤더 정보가 다르다.
+			{
+				"_id" : ObjectId("66a75a308f271b90e605e66b"),
+				"companyCode" : "GUC006",
+				"companyId" : ObjectId("662b12c53c503e2c4b977920"),
+				"orgHeader" : "COMPANY_CODE,DEPT_ID,DEPT_TYPE,PARENT_ID,DEPT_NAME,DEPT_NAME_EN,LIST_ORDER,LIST_DEPTH,IF_FLAG",
+				"userHeader" : "COMPANY_CODE,USER_ID,USER_NAME,USER_NAME_EN,LIST_ORDER,GRADE,GRADE_EN,EMAIL,LINE_NUMBER,LINE_NUMBER_C,HP_NUMBER,HP_NUMBER_C,EMP_NO,IF_FLAG,IN_WORK_YN,DEPT_ID,POLICY_CONF_AUTH,POLICY_MADN_AUTH,POLICY_PSTN_AUTH,IN_KOREA_YN,EXT_EMAIL,VACATION_YN,EMP_TYPE,POLICY_MSG_BOX_AUTH,POLICY_ORG_AUTH_MOBILE,POLICY_ORG_AUTH_PC"
+			}
+			*/
+
+			if (!headers) {
+				throw Error('NO ORG HEADER INFO..........!!!');
+			}
+
+			let strOrgHeader = JSON.stringify(headers[0].orgHeader);
+			strOrgHeader = strOrgHeader.replace(/"/g, '');
+			console.log(strOrgHeader);
+			headerArray = strOrgHeader.split(',');
+
+
+			// headers[0].orgHeader가 문자열인지 확인
+			//if (typeof headers[0].orgHeader !== 'string') {
+			if (typeof strOrgHeader !== 'string') {
+				console.log('ORG HEADER IS NOT A STRING..........!!!');
+			}else{
+				console.log('OKOKOKOKOKOOKOKOKOKOKOKOK');
+			}
+
+			// 헤더 문자열을 배열로 변환
+			// const headerArray: string[] = strOrgHeader.split(',');
+
+			// 헤더 인덱스를 저장할 객체 생성
+			let headerIndex: { [key: string]: number } = {};
+			headerArray.forEach((header: string, index: number) => {
+				headerIndex[header] = index;
+			});
+			//========================================================================================================
+
+
+
+
+			//========================================================================================================
+			// dept_id 수집, Map으로 구성한다.
+			//========================================================================================================
+			let chkCount = 0;
+			for (const line of rows) {
+				chkCount = chkCount + 1;
+				console.log("chkCount >>>>> ", chkCount);
+				const cols = line.split(spliter);
+				if (headerArray.length === 0) {
+					headerArray = cols;
+				} else {
+					console.log("chkCount ::: DEPT_ID >>> ", chkCount, headerIndex['DEPT_ID']);
+					const dept_id_index = headerIndex['DEPT_ID'];;
+					const dept_id = cols[dept_id_index];
+
+					// 모든 dept_id 수집, 다음단계에서 해당 파일에 parent_id에 해당하는 dept_id가 존재하는지 체크하기 위함이다.
+					deptMap[dept_id] = true;
+				}
+			}
+
+			const totalCounts = rows.length;
+			console.log("totalCounts >>>>>> ",totalCounts);
+			//========================================================================================================
+
+
+
+
+			for (let i = 1; i < rows.length; i++) {
+				const cols = rows[i].split(spliter);
+				const departInfo = {
+				companyCode: cols[headerIndex['COMPANY_CODE']], // COMPANY_CODE
+				departmentCode: cols[headerIndex['DEPT_ID']], //DEPT_ID
+				parentDepartmentCode: cols[headerIndex['PARENT_ID']], //PARENT_ID
+				departmentName: {
+					ko: cols[headerIndex['DEPT_NAME']], //DEPT_NAME
+					en: cols[headerIndex['DEPT_NAME_EN']], //DEPT_NAME_EN
+				},
+				siblingOrders: cols[headerIndex['LIST_ORDER']], //LIST_ORDER
+				flag: cols[headerIndex['IF_FLAG']], //IF_FLAG
+				siblingDepth: cols[headerIndex['LIST_DEPTH']], //LIST_DEPTH
+				};
+				departments.push(departInfo);
+			}
+		} catch (err) {
+			console.log(err);
+			const response = {
+				statusCode: 400,
+				body: {
+				'error': 'BROKEN_FILE',
+				},
+			};
+			return response;
+		}
+
+		const totalCounts = departments.length;
+
+		let createSuccessCounts = 0;
+		let updateSuccessCounts = 0;
+		let deleteSuccessCounts = 0;
+		let createErrorCounts = 0;
+		let updateErrorCounts = 0;
+		let deleteErrorCounts = 0;
+
+		const summaryLog = new targetSyncSummaryLogModel({
+			syncFileName: fileName,
+			startedAt: new Date().getTime(),
+			totalCounts,
+		});
+
+		const summarySyncdataLog = new targetSyncSummarySyncdataLogModel({
+			createdAt: new Date().getTime(),
+			syncEncData: data,
+			syncDecData: decoded,
+		});
+
+		interface DepartmentAttempt {
+			depart: typeof departments[0];
+			attempts: number;
+		}
+
+		const pendingDepartments: DepartmentAttempt[] = departments.map(depart => ({ depart, attempts: 0 }));
+
+		async function processPendingDepartments() {
+			while (pendingDepartments.length > 0) {
+				processChkCount = processChkCount + 1;
+
+				const nextDepart = pendingDepartments.shift();
+
+				if (!nextDepart) {
+					continue;
+				}
+
+				const { depart, attempts } = nextDepart;
+
+				//if (attempts >= totalCounts) {
+				if (attempts >= pendingDepartments.length) {
+					createErrorCounts += 1;
+
+					const errorLog = new targetSyncErrorLogModel({
+						parentLog: summaryLog._id,
+						originData: depart,
+						error: `Max attempts reached for department: ${depart.departmentCode}`,
+						createdAt: new Date().getTime(),
+					});
+					await errorLog.save();
+					continue;
+				}
+
+				try {
+					//신규등록 및 수정.
+					if (depart.flag === 'I' || depart.flag === 'U') {
+
+						const preData = await targetCompanyDepartmentModel.findOne({ originCode: depart.departmentCode });
+
+						//신규등록
+						if (!preData) {
+							let parentDepart;
+
+							try {
+								const c = await targetCompanyCompanyModel.findOne({ originCode: depart.companyCode });
+
+								if (!c) {
+									throw Error('NO_COMPANY_DATA Create');
+								}
+
+								// parent_id가 deptMap에 없으면, 에러처리 한다.
+								if(!deptMap[depart.parentDepartmentCode]){
+									console.log("000.[신규등록] - PARENT_ID 없음 >>>>>>>>>>>>>>>>>>>>>>>>>>>>> ", processChkCount, pendingDepartments.length, attempts, totalCounts, depart.parentDepartmentCode, depart.departmentCode);
+
+									const errorLog = new targetSyncErrorLogModel({
+										originData: depart,
+										error: `Parent department with code ${depart.parentDepartmentCode} not found....`,
+										createdAt: new Date().getTime(),
+									});
+									await errorLog.save();
+
+									createErrorCounts += 1;
+
+									continue;
+								}
+
+								// parent_id가 DB에 존재하는지 여부 조회.
+								parentDepart = await targetCompanyDepartmentModel.findOne({ originCode: depart.parentDepartmentCode });
+
+								// parent_id가 deptMap에 있고, parentDepartmentCode에 해당하는 정보가 DB에 없으면 pendingDepartments에 푸쉬한다.
+								if(deptMap[depart.parentDepartmentCode] && !parentDepart){
+									console.log("100.[신규등록] - DeptMap : O , parentDB : X >>>>> ", processChkCount, pendingDepartments.length, attempts, totalCounts, depart.parentDepartmentCode, depart.departmentCode);
+									pendingDepartments.push({ depart, attempts: attempts + 1 });
+									await delay(100);
+									continue;
+								}
+								// deptMap에 있고, parentDepartmentCode에 해당하는 정보가 DB에 있으면 신규등록한다.
+								else if(deptMap[depart.parentDepartmentCode] && parentDepart){
+									console.log("111.[신규등록] >>>>> ", processChkCount, pendingDepartments.length, attempts, totalCounts, depart.parentDepartmentCode, depart.departmentCode);
+									//const parentDepartments = [...parentDepart.parentDepartments, parentDepart._id];
+									const parentDepartments = parentDepart ? [...parentDepart.parentDepartments, parentDepart._id] : [];
+
+
+									const newDepart = new targetCompanyDepartmentModel({
+										originCode: depart.departmentCode,
+										departmentName: depart.departmentName,
+										parentGroup: c.parentGroup,
+										parentCompany: c._id,
+										parentDepartments,
+										childDepartments: [],
+										childUsers: [],
+										totalChildUsers: 0,
+										lastModifiedAt: new Date().getTime(),
+										siblingOrders: depart.siblingOrders,
+										siblingDepth: depart.siblingDepth,
+									});
+
+									const updateCompany = {
+										$inc: { totalChildDepartments: 1 },
+									} as any;
+
+									if (parentDepartments.length === 0) {
+										updateCompany['$push'] = {
+											childDepartments: newDepart._id,
+										};
+										await newDepart.save();
+										await targetCompanyCompanyModel.updateOne({ _id: c._id }, updateCompany);
+									} else {
+										const pd = parentDepartments[parentDepartments.length - 1];
+										await newDepart.save();
+										await targetCompanyCompanyModel.updateOne({ _id: c._id }, updateCompany);
+										await targetCompanyDepartmentModel.updateOne({ _id: pd }, {
+											$push: { childDepartments: newDepart._id },
+										});
+									}
+
+									createSuccessCounts += 1;
+								}
+							} catch (err) {
+								console.log('Error during department creation:', err);
+								createErrorCounts += 1;
+
+								const errorLog = new targetSyncErrorLogModel({
+									parentLog: summaryLog._id,
+									originData: depart,
+									error: err,
+									createdAt: new Date().getTime(),
+								});
+								await errorLog.save();
+							}
+						}
+						//수정
+						else {
+							console.log("222.[수정] >>>>> ", processChkCount, pendingDepartments.length, attempts, totalCounts, depart.parentDepartmentCode, depart.departmentCode);
+							try {
+								const parentDepart = await targetCompanyDepartmentModel.findOne({originCode: depart.parentDepartmentCode});
+
+								//const parentDepartments = [...parentDepart.parentDepartments, parentDepart._id];
+								const parentDepartments = parentDepart ? [...parentDepart.parentDepartments, parentDepart._id] : [];
+
+								await targetCompanyDepartmentModel.updateOne({originCode: depart.departmentCode}, {
+									departmentName: depart.departmentName,
+									parentDepartments,
+									siblingOrders: depart.siblingOrders,
+									siblingDepth: depart.siblingDepth,
+									lastModifiedAt: new Date().getTime(),
+								});
+
+								if (JSON.stringify(parentDepartments) !== JSON.stringify(preData.parentDepartments)) {
+								await targetCompanyDepartmentModel.updateOne({_id: parentDepartments[parentDepartments.length - 1]._id}, {
+									$push: {
+									childDepartments: preData._id,
+									},
+								});
+
+								await targetCompanyDepartmentModel.updateOne({_id: preData.parentDepartments[preData.parentDepartments.length - 1]._id}, {
+									$pull: {
+									childDepartments: preData._id,
+									},
+								});
+								}
+
+								updateSuccessCounts += 1;
+							}catch(err){
+								console.log('Error during department update:', err);
+								updateErrorCounts += 1;
+
+								const errorLog = new targetSyncErrorLogModel({
+								parentLog: summaryLog._id,
+								originData: depart,
+								error: err,
+								createdAt: new Date().getTime(),
+								});
+								await errorLog.save();
+							}
+						}
+					}
+					//삭제
+					else if(depart.flag === 'D'){
+						try {
+							const d = await targetCompanyDepartmentModel.findOne({originCode: depart.departmentCode}).select('_id');
+
+							await targetCompanyDepartmentModel.updateOne({_id: d._id}, {
+								isDeleted: true,
+							});
+
+							await targetCompanyDepartmentModel.updateOne({originCode: depart.parentDepartmentCode}, {
+								$pull: {
+								childDepartments: d._id,
+								}
+							});
+
+							deleteSuccessCounts += 1;
+						}catch(err){
+							console.log('Error during department delete:', err);
+
+							deleteErrorCounts += 1;
+
+							const errorLog = new targetSyncErrorLogModel({
+								parentLog: summaryLog._id,
+								originData: depart,
+								error: err,
+								createdAt: new Date().getTime(),
+							});
+							await errorLog.save();
+						}
+					}
+				} catch (err) {
+				console.log('Error processing department:', err);
+				const errorLog = new targetSyncErrorLogModel({
+					parentLog: summaryLog._id,
+					originData: depart,
+					error: err,
+					createdAt: new Date().getTime(),
+				});
+				await errorLog.save();
+				}
+			}
+		}
+
+		await processPendingDepartments();
+
+		function delay(ms: number) {
+			return new Promise(resolve => setTimeout(resolve, ms));
+		}
+
+		ctx.status = 200;
+		ctx.body = {
+		'success': true,
+		};
+
+
+		summarySyncdataLog.parentSummary = summaryLog._id;
+		await summarySyncdataLog.save();
+
+		summaryLog.endedAt = new Date().getTime();
+		summaryLog.successCounts = {
+		create: createSuccessCounts,
+		update: updateSuccessCounts,
+		delete: deleteSuccessCounts,
+		};
+		summaryLog.errorCounts = {
+		create: createErrorCounts,
+		update: updateErrorCounts,
+		delete: deleteErrorCounts,
+		};
+		await summaryLog.save();
+
+	} catch (err) {
+		console.log(err);
+		ctx.status = 500;
+		ctx.body = {
+		'success': false,
+		'error': 'internal server error',
+		};
+	}
+};
+
+export default syncDepartment;
